@@ -303,6 +303,15 @@ def _get_coordinate_spacing(coord, spacing_tol):
     return delta
 
 
+def _true_phase_scaling(coord, lag):
+    # Take advantage of xarray broadcasting and ordered coordinates
+    return xr.DataArray(
+            np.exp(-1j * 2.0 * np.pi * coord * lag),
+            dims=coord.name,
+            coords={coord.name: coord},
+        )
+
+
 def fft(
     da,
     spacing_tol=1e-3,
@@ -382,6 +391,7 @@ def fft(
                 "The dimension along which real FT is taken must be one of the existing dimensions."
             )
         else:
+            shift = False
             dim = move_to_end(dim, real_dim)
 
     _check_valid_fft_coords(da, dim)
@@ -389,7 +399,8 @@ def fft(
     if chunks_to_segments:
         da = _stack_chunks(da, dim)
 
-    rawdims = da.dims  # take care of segmented dimesions, if any
+    # We need to put the real dim last, so remember the original ordering of dims so we can transpose back
+    untransposed_dims = da.dims
 
     if real_dim is not None:
         da = da.transpose(*move_to_end(da.dims, real_dim))
@@ -399,13 +410,7 @@ def fft(
     if real_dim is None:
         fft_fn = fftm.fftn
     else:
-        shift = False
         fft_fn = fftm.rfftn
-
-    # the axes along which to take ffts
-    axis_num = [da.get_axis_num(d) for d in dim]
-
-    N = [da.shape[n] for n in axis_num]
 
     # raise error if there are multiple coordinates attached to the dimension(s) over which the FFT is taken
     for d in dim:
@@ -419,6 +424,7 @@ def fft(
             )
 
     delta_x = [_get_coordinate_spacing(da[d], spacing_tol) for d in dim]
+
     lag_x = [_lag_coord(da[d]) for d in dim]
 
     if detrend is not None:
@@ -431,6 +437,9 @@ def fft(
     if window is not None:
         _, da = _apply_window(da, dim, window_type=window)
 
+    # the axes along which to take ffts
+    axis_num = [da.get_axis_num(d) for d in dim]
+        
     if true_phase:
         reversed_axis = [
             da.get_axis_num(d) for d in dim if da[d][-1] < da[d][0]
@@ -445,34 +454,28 @@ def fft(
     if shift:
         f = fftm.fftshift(f, axes=axis_num)
 
-    k = _freq(N, delta_x, real_dim, shift)
+    fft_lengths = [da.shape[n] for n in axis_num]
+        
+    fft_freqs = _freq(fft_lengths, delta_x, real_dim, shift)
 
-    newcoords, swap_dims = _new_dims_and_coords(da, dim, k, prefix)
+    freq_coords, freq_dims_dict = _new_dims_and_coords(da, dim, fft_freqs, prefix)
+
     daft = xr.DataArray(
         f, dims=da.dims, coords=dict([c for c in da.coords.items() if c[0] not in dim])
-    )
-    daft = daft.swap_dims(swap_dims).assign_coords(newcoords)
-    daft = daft.drop([d for d in dim if d in daft.coords])
-
-    updated_dims = [
-        daft.dims[i] for i in da.get_axis_num(dim)
-    ]  # List of transformed dimensions
+    ).swap_dims(freq_dims_dict).assign_coords(freq_coords)
 
     if true_phase:
-        for up_dim, lag in zip(updated_dims, lag_x):
-            daft = daft * xr.DataArray(
-                np.exp(-1j * 2.0 * np.pi * newcoords[up_dim] * lag),
-                dims=up_dim,
-                coords={up_dim: newcoords[up_dim]},
-            )  # taking advantage of xarray broadcasting and ordered coordinates
-            daft[up_dim].attrs.update({"direct_lag": lag})
+        for d, lag in zip(freq_dims_dict.values(), lag_x):
+            daft *= _true_phase_scaling(freq_coords[d], lag)
+            daft[d].attrs.update({"direct_lag": lag})
 
     if true_amplitude:
         daft = daft * np.prod(delta_x)
 
-    return daft.transpose(
-        *[swap_dims.get(d, d) for d in rawdims]
-    )  # Do nothing if da was not transposed
+    # The order the final dims would be in if we hadn't moved the real dim
+    final_dims = [freq_dims_dict.get(d, d) for d in untransposed_dims]
+
+    return daft.transpose(*final_dims)
 
 
 def ifft(
@@ -625,9 +628,7 @@ def ifft(
         f,
         dims=daft.dims,
         coords=dict([c for c in daft.coords.items() if c[0] not in dim]),
-    )
-    da = da.swap_dims(swap_dims).assign_coords(newcoords)
-    da = da.drop([d for d in dim if d in da.coords])
+    ).swap_dims(swap_dims).assign_coords(newcoords)
 
     with xr.set_options(
         keep_attrs=True
