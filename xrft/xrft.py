@@ -29,6 +29,7 @@ __all__ = [
     "isotropic_power_spectrum",
     "isotropic_cross_spectrum",
     "fit_loglog",
+    "empty_fft"
 ]
 
 
@@ -294,11 +295,11 @@ def _get_coordinate_spacing(coord, spacing_tol):
     delta = np.abs(diff[0])
     if not np.allclose(diff, diff[0], rtol=spacing_tol):
         raise ValueError(
-            f"Can't take Fourier transform because coodinate {coord.name} is not evenly spaced" 
+            f"Can't take Fourier transform because coodinate {coord.name} is not evenly spaced"
         )
     if delta == 0.0:
         raise ValueError(
-            f"Can't take Fourier transform because spacing in coordinate {coord.name} is zero" 
+            f"Can't take Fourier transform because spacing in coordinate {coord.name} is zero"
         )
     return delta
 
@@ -306,10 +307,141 @@ def _get_coordinate_spacing(coord, spacing_tol):
 def _true_phase_scaling(coord, lag):
     # Take advantage of xarray broadcasting and ordered coordinates
     return xr.DataArray(
-            np.exp(-1j * 2.0 * np.pi * coord * lag),
-            dims=coord.name,
-            coords={coord.name: coord},
-        )
+        np.exp(-1j * 2.0 * np.pi * coord * lag),
+        dims=coord.name,
+        coords={coord.name: coord},
+    )
+
+
+def empty_fft(
+    da,
+    spacing_tol=1e-3,
+    dim=None,
+    real_dim=None,
+    shift=True,
+    true_phase=True,
+    chunks_to_segments=False,
+    prefix="freq_",
+    **kwargs,
+):
+    """
+    Perform discrete Fourier transform of xarray data-array `da` along the
+    specified dimensions.
+
+    .. math::
+        daft = \mathbb{F}(da - \overline{da})
+
+    Parameters
+    ----------
+    da : `xarray.DataArray`
+        The data to be transformed
+    spacing_tol: float, optional
+        Spacing tolerance. Fourier transform should not be applied to uneven grid but
+        this restriction can be relaxed with this setting. Use caution.
+    dim : str or sequence of str, optional
+        The dimensions along which to take the transformation. If `None`, all
+        dimensions will be transformed. If the inputs are dask arrays, the
+        arrays must not be chunked along these dimensions.
+    real_dim : str, optional
+        Real Fourier transform will be taken along this dimension.
+    shift : bool, default
+        Whether to shift the fft output. Default is `True`, unless `real_dim is not None`,
+        in which case shift will be set to False always.
+    true_phase : bool, optional
+        If set to False, standard fft algorithm is applied on signal without consideration of coordinates.
+        If set to True, coordinates location are correctly taken into account to evaluate Fourier Tranforrm phase and
+        fftshift is applied on input signal prior to fft  (fft algorithm intrinsically considers that input signal is on fftshifted grid).
+    chunks_to_segments : bool, optional
+        Whether the data is chunked along the axis to take FFT.
+    prefix : str
+        The prefix for the new transformed dimensions.
+
+    Returns
+    -------
+    daft : `xarray.DataArray`
+        The output of the Fourier transformation, with appropriate dimensions.
+    """
+    if dim is None:
+        dim = list(da.dims)
+    else:
+        if isinstance(dim, str):
+            dim = [dim]
+
+    if "real" in kwargs:
+        real_dim = kwargs.get("real")
+        warnings.warn(_real_flag_warning, FutureWarning)
+
+    if real_dim is not None:
+        if real_dim not in da.dims:
+            raise ValueError(
+                "The dimension along which real FT is taken must be one of the existing dimensions."
+            )
+        else:
+            shift = False
+            dim = move_to_end(dim, real_dim)
+
+    _check_valid_fft_coords(da, dim)
+
+    if chunks_to_segments:
+        da = _stack_chunks(da, dim)
+
+    # We need to put the real dim last, so remember the original ordering of dims so we can transpose back
+    initial_untransposed_dims = da.dims
+
+    if real_dim is not None:
+        da = da.transpose(*move_to_end(da.dims, real_dim))
+
+    fftm = _fft_module(da)
+
+    if real_dim is None:
+        fft_fn = fftm.fftn
+    else:
+        fft_fn = fftm.rfftn
+
+    # raise error if there are multiple coordinates attached to the dimension(s) over which the FFT is taken
+    for d in dim:
+        bad_coords = [
+            cname for cname in da.coords if cname != d and d in da[cname].dims
+        ]
+        if bad_coords:
+            raise ValueError(
+                f"The input array contains coordinate variable(s) ({bad_coords}) whose dims include the transform dimension(s) `{d}`. "
+                f"Please drop these coordinates (`.drop({bad_coords}`) before invoking xrft."
+            )
+
+    delta_x = [_get_coordinate_spacing(da[d], spacing_tol) for d in dim]
+
+    lag_x = [_lag_coord(da[d]) for d in dim]
+
+    fft_lengths = [da.sizes[d] for d in dim]
+
+    fft_freqs = _freq(fft_lengths, delta_x, real_dim, shift)
+
+    freq_coords, freq_dims_dict = _new_dims_and_coords(da, dim, fft_freqs, prefix)
+
+    final_transposed_coords = {
+        freq_dims_dict.get(d, d): da[d]
+        if d not in freq_dims_dict
+        else freq_coords[freq_dims_dict[d]]
+        for d in da.dims
+    }
+
+    shape = [len(c) for c in final_transposed_coords.values()]
+
+    daft = xr.DataArray(
+        np.empty(shape), dims=final_transposed_coords, coords=final_transposed_coords
+    )
+
+    if true_phase:
+        for d, lag in zip(freq_dims_dict.values(), lag_x):
+            daft[d].attrs.update({"direct_lag": lag})
+
+    # The order the final dims would be in if we hadn't moved the real dim
+    final_untransposed_dims = [
+        freq_dims_dict.get(d, d) for d in initial_untransposed_dims
+    ]
+
+    return daft.transpose(*final_untransposed_dims)
 
 
 def fft(
@@ -439,7 +571,7 @@ def fft(
 
     # the axes along which to take ffts
     axis_num = [da.get_axis_num(d) for d in dim]
-        
+
     if true_phase:
         reversed_axis = [
             da.get_axis_num(d) for d in dim if da[d][-1] < da[d][0]
@@ -455,14 +587,20 @@ def fft(
         f = fftm.fftshift(f, axes=axis_num)
 
     fft_lengths = [da.shape[n] for n in axis_num]
-        
+
     fft_freqs = _freq(fft_lengths, delta_x, real_dim, shift)
 
     freq_coords, freq_dims_dict = _new_dims_and_coords(da, dim, fft_freqs, prefix)
 
-    daft = xr.DataArray(
-        f, dims=da.dims, coords=dict([c for c in da.coords.items() if c[0] not in dim])
-    ).swap_dims(freq_dims_dict).assign_coords(freq_coords)
+    daft = (
+        xr.DataArray(
+            f,
+            dims=da.dims,
+            coords=dict([c for c in da.coords.items() if c[0] not in dim]),
+        )
+        .swap_dims(freq_dims_dict)
+        .assign_coords(freq_coords)
+    )
 
     if true_phase:
         for d, lag in zip(freq_dims_dict.values(), lag_x):
@@ -624,11 +762,15 @@ def ifft(
     k = _ifreq(N, delta_x, real_dim, shift)
 
     newcoords, swap_dims = _new_dims_and_coords(daft, dim, k, prefix)
-    da = xr.DataArray(
-        f,
-        dims=daft.dims,
-        coords=dict([c for c in daft.coords.items() if c[0] not in dim]),
-    ).swap_dims(swap_dims).assign_coords(newcoords)
+    da = (
+        xr.DataArray(
+            f,
+            dims=daft.dims,
+            coords=dict([c for c in daft.coords.items() if c[0] not in dim]),
+        )
+        .swap_dims(swap_dims)
+        .assign_coords(newcoords)
+    )
 
     with xr.set_options(
         keep_attrs=True
