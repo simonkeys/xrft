@@ -429,7 +429,7 @@ def empty_fft(
     shape = [len(c) for c in final_transposed_coords.values()]
 
     daft = xr.DataArray(
-        np.empty(shape), dims=final_transposed_coords, coords=final_transposed_coords
+        np.zeros(shape), dims=final_transposed_coords, coords=final_transposed_coords
     )
 
     if true_phase:
