@@ -174,6 +174,10 @@ def _ifreq(N, delta_x, real, shift):
 
     return k
 
+def _coord_units(da, dim):
+    """Get the pint_xarray units of specified dimension in dataarray."""
+    # This rigamarole is necessary because pint_xarray can't directly quantify coordinates. That may change in the future. 
+    return da.swap_dims({dim: 'tmp_dim'})[dim].pint.quantify().pint.units
 
 def _new_dims_and_coords(da, dim, wavenm, prefix):
     # set up new dimensions and coordinates for dataarray
@@ -185,6 +189,8 @@ def _new_dims_and_coords(da, dim, wavenm, prefix):
         k = wavenm[d]
         new_name = prefix + d if d[: len(prefix)] != prefix else d[len(prefix) :]
         new_dim = xr.DataArray(k, dims=new_name, coords={new_name: k}, name=new_name)
+        try: new_dim = new_dim.pint.quantify({new_name: (1 / _coord_units(da, d)).units}).pint.dequantify() # Apply frequency units to coordinate
+        except (AttributeError, TypeError): pass
         new_dim.attrs.update({"spacing": k[1] - k[0]})
         new_coords[new_name] = new_dim
         swap_dims[d] = new_name
@@ -303,7 +309,6 @@ def _get_coordinate_spacing(coord, spacing_tol):
         )
     return delta
 
-
 def fft(
     da,
     spacing_tol=1e-3,
@@ -367,6 +372,12 @@ def fft(
     daft : `xarray.DataArray`
         The output of the Fourier transformation, with appropriate dimensions.
     """
+    try: 
+        units = da.pint.units
+        da = da.pint.dequantify()
+    except AttributeError: 
+        units = None
+
     if dim is None:
         dim = list(da.dims)
     else:
@@ -455,6 +466,9 @@ def fft(
     daft = daft.swap_dims(swap_dims).assign_coords(newcoords)
     daft = daft.drop([d for d in dim if d in daft.coords])
 
+    try: daft = daft.pint.quantify(units) # Apply units of da to daft
+    except AttributeError: pass
+
     updated_dims = [
         daft.dims[i] for i in da.get_axis_num(dim)
     ]  # List of transformed dimensions
@@ -470,6 +484,10 @@ def fft(
 
     if true_amplitude:
         daft = daft * np.prod(delta_x)
+        try: 
+            if units is not None:
+                daft = daft * np.prod([_coord_units(da[d], d) for d in dim]) 
+        except (AttributeError, TypeError): pass
 
     return daft.transpose(
         *[swap_dims.get(d, d) for d in rawdims]
@@ -534,6 +552,13 @@ def ifft(
     da : `xarray.DataArray`
         The output of the Inverse Fourier transformation, with appropriate dimensions.
     """
+
+    try: 
+        units = daft.pint.units
+        daft = daft.pint.dequantify()
+    except AttributeError:
+        units = None
+
     if dim is None:
         dim = list(daft.dims)
     else:
@@ -631,6 +656,9 @@ def ifft(
     da = da.swap_dims(swap_dims).assign_coords(newcoords)
     da = da.drop([d for d in dim if d in da.coords])
 
+    try: da = da.pint.quantify(units) # Apply units of daft to da
+    except AttributeError: raise
+
     with xr.set_options(
         keep_attrs=True
     ):  # This line ensures keeping spacing attribute in output coordinates
@@ -640,6 +668,10 @@ def ifft(
 
     if true_amplitude:
         da = da / np.prod([float(da[up_dim].spacing) for up_dim in swap_dims.values()])
+        try: 
+            if units is not None:
+                da = da / np.prod([_coord_units(da[up_dim], up_dim) for up_dim in swap_dims.values()]) 
+        except (AttributeError, TypeError): pass
 
     return da.transpose(
         *[swap_dims.get(d, d) for d in rawdims]
@@ -662,6 +694,8 @@ def _window_correction_factor(da, dim, scaling, window):
 
 def _psd_scaling_factor(ps, dims, scaling):
     fs = np.prod([float(ps[d].spacing) for d in dims])
+    try: fs = fs * np.prod([_coord_units(ps, d) for d in dims])
+    except (AttributeError, TypeError): pass
     if scaling == "density":
         return fs
     elif scaling == "spectrum":
